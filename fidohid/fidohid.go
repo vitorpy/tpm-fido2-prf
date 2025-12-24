@@ -32,6 +32,7 @@ func New(ctx context.Context, name string) (*SoftToken, error) {
 		device:    d,
 		evtChan:   evtChan,
 		authEvent: make(chan AuthEvent),
+		cborEvent: make(chan CborEvent),
 	}
 
 	return &t, nil
@@ -41,6 +42,7 @@ type SoftToken struct {
 	device    *uhid.Device
 	evtChan   chan uhid.Event
 	authEvent chan AuthEvent
+	cborEvent chan CborEvent
 
 	authFunc func()
 }
@@ -53,8 +55,20 @@ type AuthEvent struct {
 	Error error
 }
 
+// CborEvent represents a CTAP2 CBOR message
+type CborEvent struct {
+	ChanID  uint32
+	Cmd     CmdType
+	RawData []byte // Raw CBOR data (command byte + CBOR payload)
+}
+
 func (t *SoftToken) Events() chan AuthEvent {
 	return t.authEvent
+}
+
+// CborEvents returns the channel for CTAP2 CBOR events
+func (t *SoftToken) CborEvents() chan CborEvent {
+	return t.cborEvent
 }
 
 func (t *SoftToken) Run(ctx context.Context) {
@@ -129,6 +143,19 @@ func (t *SoftToken) Run(ctx context.Context) {
 
 			select {
 			case t.authEvent <- evt:
+			case <-ctx.Done():
+				return
+			}
+		case CmdCbor:
+			// CTAP2 CBOR message - send to CBOR event channel
+			evt := CborEvent{
+				ChanID:  reqChanID,
+				Cmd:     cmd,
+				RawData: innerMsg,
+			}
+
+			select {
+			case t.cborEvent <- evt:
 			case <-ctx.Done():
 				return
 			}
@@ -434,7 +461,7 @@ func newInitResponse(channelID uint32, nonce [8]byte) *initResponse {
 		MajorDeviceVersion: deviceMajor,
 		MinorDeviceVersion: deviceMinor,
 		BuildDeviceVersion: deviceBuild,
-		// RawCapabilities:    winkCapability,
+		RawCapabilities:    cborCapability, // Advertise CTAP2/CBOR support
 	}
 }
 
@@ -455,6 +482,17 @@ func (resp *initResponse) Marshal() []byte {
 
 func (t *SoftToken) WriteResponse(ctx context.Context, evt AuthEvent, data []byte, status uint16) error {
 	return writeRespose(t.device, evt.chanID, evt.cmd, data, status)
+}
+
+// WriteCborResponse writes a CTAP2 CBOR response
+// The response format is: [status byte] [CBOR data]
+func (t *SoftToken) WriteCborResponse(ctx context.Context, evt CborEvent, status byte, data []byte) error {
+	// CTAP2 response format: status byte followed by optional CBOR data
+	response := make([]byte, 1+len(data))
+	response[0] = status
+	copy(response[1:], data)
+	// For CTAP2, we don't append a U2F status code (the status is in the first byte)
+	return writeRespose(t.device, evt.ChanID, evt.Cmd, response, 0)
 }
 
 func writeRespose(d *uhid.Device, chanID uint32, cmd CmdType, data []byte, status uint16) error {

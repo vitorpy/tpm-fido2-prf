@@ -2,6 +2,7 @@ package tpm
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
@@ -156,6 +157,35 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 	y := new(big.Int).SetBytes(pub.ECCParameters.Point.YRaw)
 
 	return out.Bytes(), x, y, nil
+}
+
+// DeriveCredRandom derives a credential-specific random value for hmac-secret extension
+// Extracts the seed from the keyHandle and uses HMAC-SHA256(seed, "credential-random")
+func (t *TPM) DeriveCredRandom(keyHandle []byte) ([]byte, error) {
+	dec := lencode.NewDecoder(bytes.NewReader(keyHandle), lencode.SeparatorOpt(separator))
+
+	// Skip private key
+	_, err := dec.Decode()
+	if err != nil {
+		return nil, fmt.Errorf("invalid key handle: missing private")
+	}
+
+	// Skip public key
+	_, err = dec.Decode()
+	if err != nil {
+		return nil, fmt.Errorf("invalid key handle: missing public")
+	}
+
+	// Get seed
+	seed, err := dec.Decode()
+	if err != nil {
+		return nil, fmt.Errorf("invalid key handle: missing seed")
+	}
+
+	// Derive credential random using HMAC-SHA256(seed, "credential-random")
+	mac := hmac.New(sha256.New, seed)
+	mac.Write([]byte("credential-random"))
+	return mac.Sum(nil), nil
 }
 
 func (t *TPM) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, error) {

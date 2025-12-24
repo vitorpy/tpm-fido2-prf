@@ -3,6 +3,7 @@ package memory
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
@@ -58,6 +59,14 @@ func (m *Mem) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 	}
 
 	return keyHandle, x, y, nil
+}
+
+// DeriveCredRandom derives a credential-specific random value for hmac-secret extension
+// Uses HMAC-SHA256(masterPrivateKey, credentialID)
+func (m *Mem) DeriveCredRandom(credentialID []byte) ([]byte, error) {
+	mac := hmac.New(sha256.New, m.masterPrivateKey)
+	mac.Write(credentialID)
+	return mac.Sum(nil), nil
 }
 
 func (m *Mem) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, error) {

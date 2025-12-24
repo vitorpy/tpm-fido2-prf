@@ -89,14 +89,17 @@ func (pe *Pinentry) prompt(req *request, prompt string) {
 
 	childCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	log.Printf("pinentry: launching pinentry...")
 	p, cmd, err := launchPinEntry(childCtx)
 	if err != nil {
+		log.Printf("pinentry: failed to launch: %v", err)
 		sendResult(Result{
 			OK:    false,
 			Error: fmt.Errorf("failed to start pinentry: %w", err),
 		})
 		return
 	}
+	log.Printf("pinentry: launched successfully, cmd=%v", cmd.Args)
 	defer func() {
 		cancel()
 		cmd.Wait()
@@ -107,20 +110,22 @@ func (pe *Pinentry) prompt(req *request, prompt string) {
 	p.SetPrompt("TPM-FIDO")
 	p.SetDesc(prompt)
 
-	promptResult := make(chan bool)
+	promptResult := make(chan error)
 
 	go func() {
 		err := p.Confirm()
-		promptResult <- err == nil
+		log.Printf("pinentry Confirm() returned: %v", err)
+		promptResult <- err
 	}()
 
 	timer := time.NewTimer(req.timeout)
 
 	for {
 		select {
-		case ok := <-promptResult:
+		case err := <-promptResult:
 			sendResult(Result{
-				OK: ok,
+				OK:    err == nil,
+				Error: err,
 			})
 			return
 		case <-timer.C:
@@ -139,12 +144,14 @@ func (pe *Pinentry) prompt(req *request, prompt string) {
 }
 
 func FindPinentryGUIPath() string {
+	// Prefer Qt on Wayland as it tends to work better
 	candidates := []string{
-		"pinentry-gnome3",
 		"pinentry-qt5",
-		"pinentry-qt4",
 		"pinentry-qt",
+		"pinentry-gnome3",
+		"pinentry-qt4",
 		"pinentry-gtk-2",
+		"pinentry-gtk",
 		"pinentry-x11",
 		"pinentry-fltk",
 	}

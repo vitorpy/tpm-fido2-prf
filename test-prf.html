@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PRF Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; max-width: 800px; margin: 0 auto; }
+        button { padding: 10px 20px; margin: 10px 5px 10px 0; cursor: pointer; }
+        pre { background: #f0f0f0; padding: 10px; overflow-x: auto; white-space: pre-wrap; }
+        .success { color: green; }
+        .error { color: red; }
+        #log { background: #1e1e1e; color: #d4d4d4; padding: 15px; min-height: 200px; }
+    </style>
+</head>
+<body>
+    <h1>WebAuthn PRF Extension Test</h1>
+    <p>Test the PRF (hmac-secret) extension with your authenticator.</p>
+
+    <div>
+        <button id="register">1. Register Credential</button>
+        <button id="authenticate" disabled>2. Authenticate with PRF</button>
+    </div>
+
+    <h3>Log:</h3>
+    <pre id="log"></pre>
+
+    <script>
+        const logEl = document.getElementById('log');
+        let credential = null;
+
+        function log(msg, isError = false) {
+            const time = new Date().toLocaleTimeString();
+            const line = `[${time}] ${msg}\n`;
+            logEl.innerHTML += isError ? `<span class="error">${line}</span>` : line;
+            logEl.scrollTop = logEl.scrollHeight;
+            console.log(msg);
+        }
+
+        function toBase64(buffer) {
+            return btoa(String.fromCharCode(...new Uint8Array(buffer)));
+        }
+
+        function fromBase64(str) {
+            return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+        }
+
+        // Register button
+        document.getElementById('register').addEventListener('click', async () => {
+            log('Starting registration...');
+
+            try {
+                const challenge = crypto.getRandomValues(new Uint8Array(32));
+                const userId = crypto.getRandomValues(new Uint8Array(16));
+
+                const publicKey = {
+                    challenge: challenge,
+                    rp: {
+                        name: "PRF Test",
+                        id: location.hostname
+                    },
+                    user: {
+                        id: userId,
+                        name: "testuser@example.com",
+                        displayName: "Test User"
+                    },
+                    pubKeyCredParams: [
+                        { alg: -7, type: "public-key" },  // ES256
+                        { alg: -257, type: "public-key" } // RS256
+                    ],
+                    authenticatorSelection: {
+                        userVerification: "discouraged"
+                    },
+                    timeout: 60000,
+                    extensions: {
+                        prf: {}
+                    }
+                };
+
+                log('Calling navigator.credentials.create()...');
+                log('Options: ' + JSON.stringify({
+                    rpId: publicKey.rp.id,
+                    extensions: publicKey.extensions
+                }));
+
+                credential = await navigator.credentials.create({ publicKey });
+
+                log('Registration successful!', false);
+                log('Credential ID: ' + toBase64(credential.rawId));
+
+                const extResults = credential.getClientExtensionResults();
+                log('Extension results: ' + JSON.stringify(extResults));
+
+                if (extResults.prf) {
+                    log('PRF supported: ' + JSON.stringify(extResults.prf), false);
+                } else {
+                    log('PRF extension not in results (may still work on auth)', false);
+                }
+
+                document.getElementById('authenticate').disabled = false;
+                log('Now click "Authenticate with PRF" to test PRF output');
+
+            } catch (err) {
+                log('Registration error: ' + err.message, true);
+                console.error(err);
+            }
+        });
+
+        // Authenticate button
+        document.getElementById('authenticate').addEventListener('click', async () => {
+            if (!credential) {
+                log('No credential registered yet!', true);
+                return;
+            }
+
+            log('Starting authentication with PRF...');
+
+            try {
+                const challenge = crypto.getRandomValues(new Uint8Array(32));
+                const salt = new TextEncoder().encode("prf-test-salt-value-1234567890!!");  // 32 bytes
+
+                log('Using salt: ' + toBase64(salt));
+
+                const publicKey = {
+                    challenge: challenge,
+                    rpId: location.hostname,
+                    allowCredentials: [{
+                        id: credential.rawId,
+                        type: "public-key"
+                    }],
+                    userVerification: "discouraged",
+                    timeout: 60000,
+                    extensions: {
+                        prf: {
+                            eval: {
+                                first: salt
+                            }
+                        }
+                    }
+                };
+
+                log('Calling navigator.credentials.get()...');
+                log('PRF eval salt (first): ' + toBase64(salt));
+
+                const assertion = await navigator.credentials.get({ publicKey });
+
+                log('Authentication successful!', false);
+
+                const extResults = assertion.getClientExtensionResults();
+                log('Extension results: ' + JSON.stringify(extResults));
+
+                if (extResults.prf && extResults.prf.results) {
+                    const prfOutput = extResults.prf.results.first;
+                    if (prfOutput) {
+                        log('SUCCESS! PRF output (first): ' + toBase64(prfOutput), false);
+                        log('PRF output length: ' + prfOutput.byteLength + ' bytes', false);
+                    } else {
+                        log('PRF results present but no "first" output', true);
+                    }
+                } else {
+                    log('No PRF results in extension output', true);
+                    log('Full extension results: ' + JSON.stringify(extResults), true);
+                }
+
+            } catch (err) {
+                log('Authentication error: ' + err.message, true);
+                console.error(err);
+            }
+        });
+
+        log('Ready. Click "Register Credential" to start.');
+        log('Note: This page must be served over HTTPS or localhost.');
+    </script>
+</body>
+</html>

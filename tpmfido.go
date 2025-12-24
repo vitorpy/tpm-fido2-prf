@@ -14,13 +14,14 @@ import (
 	"time"
 
 	"github.com/psanford/tpm-fido/attestation"
+	"github.com/psanford/tpm-fido/ctap2"
 	"github.com/psanford/tpm-fido/fidoauth"
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/memory"
-	"github.com/psanford/tpm-fido/pinentry"
 	"github.com/psanford/tpm-fido/sitesignatures"
 	"github.com/psanford/tpm-fido/statuscode"
 	"github.com/psanford/tpm-fido/tpm"
+	"github.com/psanford/tpm-fido/userpresence"
 )
 
 var backend = flag.String("backend", "tpm", "tpm|memory")
@@ -33,7 +34,7 @@ func main() {
 }
 
 type server struct {
-	pe     *pinentry.Pinentry
+	up     *userpresence.UserPresence
 	signer Signer
 }
 
@@ -41,11 +42,12 @@ type Signer interface {
 	RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, error)
 	SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, error)
 	Counter() uint32
+	DeriveCredRandom(credentialID []byte) ([]byte, error)
 }
 
 func newServer() *server {
 	s := server{
-		pe: pinentry.New(),
+		up: userpresence.New(),
 	}
 	if *backend == "tpm" {
 		signer, err := tpm.New(*device)
@@ -66,42 +68,64 @@ func newServer() *server {
 func (s *server) run() {
 	ctx := context.Background()
 
-	if pinentry.FindPinentryGUIPath() == "" {
-		log.Printf("warning: no gui pinentry binary detected in PATH. tpm-fido may not work correctly without a gui based pinentry")
-	}
-
 	token, err := fidohid.New(ctx, "tpm-fido")
 	if err != nil {
 		log.Fatalf("create fido hid error: %s", err)
 	}
 
+	// Create CTAP2 handler
+	ctap2Handler := ctap2.NewHandler(s.signer, s.up)
+
 	go token.Run(ctx)
 
-	for evt := range token.Events() {
-		if evt.Error != nil {
-			log.Printf("got token error: %s", err)
-			continue
+	// Listen on both U2F/CTAP1 and CTAP2 event channels
+	for {
+		select {
+		case evt := <-token.Events():
+			// Handle U2F/CTAP1 messages
+			if evt.Error != nil {
+				log.Printf("got token error: %s", evt.Error)
+				continue
+			}
+
+			req := evt.Req
+
+			if req.Command == fidoauth.CmdAuthenticate {
+				log.Printf("got AuthenticateCmd site=%s", sitesignatures.FromAppParam(req.Authenticate.ApplicationParam))
+				s.handleAuthenticate(ctx, token, evt)
+			} else if req.Command == fidoauth.CmdRegister {
+				log.Printf("got RegisterCmd site=%s", sitesignatures.FromAppParam(req.Register.ApplicationParam))
+				s.handleRegister(ctx, token, evt)
+			} else if req.Command == fidoauth.CmdVersion {
+				log.Print("got VersionCmd")
+				s.handleVersion(ctx, token, evt)
+			} else {
+				log.Printf("unsupported request type: 0x%02x\n", req.Command)
+				token.WriteResponse(ctx, evt, nil, statuscode.ClaNotSupported)
+			}
+
+		case cborEvt := <-token.CborEvents():
+			// Handle CTAP2 CBOR messages
+			s.handleCborEvent(ctx, token, cborEvt, ctap2Handler)
 		}
+	}
+}
 
-		req := evt.Req
+// handleCborEvent dispatches CTAP2 CBOR commands
+func (s *server) handleCborEvent(ctx context.Context, token *fidohid.SoftToken, evt fidohid.CborEvent, h *ctap2.Handler) {
+	if len(evt.RawData) < 1 {
+		log.Printf("CTAP2: Empty CBOR message")
+		token.WriteCborResponse(ctx, evt, ctap2.StatusInvalidCommand, nil)
+		return
+	}
 
-		if req.Command == fidoauth.CmdAuthenticate {
-			log.Printf("got AuthenticateCmd site=%s", sitesignatures.FromAppParam(req.Authenticate.ApplicationParam))
+	cmd := evt.RawData[0]
+	data := evt.RawData[1:]
 
-			s.handleAuthenticate(ctx, token, evt)
-		} else if req.Command == fidoauth.CmdRegister {
-			log.Printf("got RegisterCmd site=%s", sitesignatures.FromAppParam(req.Register.ApplicationParam))
-			s.handleRegister(ctx, token, evt)
-		} else if req.Command == fidoauth.CmdVersion {
-			log.Print("got VersionCmd")
-			s.handleVersion(ctx, token, evt)
-		} else {
-			log.Printf("unsupported request type: 0x%02x\n", req.Command)
-			// send a not supported error for any commands that we don't understand.
-			// Browsers depend on this to detect what features the token supports
-			// (i.e. the u2f backwards compatibility)
-			token.WriteResponse(ctx, evt, nil, statuscode.ClaNotSupported)
-		}
+	status, response := h.HandleCommand(ctx, cmd, data)
+	err := token.WriteCborResponse(ctx, evt, status, response)
+	if err != nil {
+		log.Printf("CTAP2: Write response error: %s", err)
 	}
 }
 
@@ -158,10 +182,10 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 
 	if req.Authenticate.Ctrl == fidoauth.CtrlEnforeUserPresenceAndSign {
 
-		pinResultCh, err := s.pe.ConfirmPresence("FIDO Confirm Auth", req.Authenticate.ChallengeParam, req.Authenticate.ApplicationParam)
+		pinResultCh, err := s.up.ConfirmPresence("FIDO Confirm Auth", req.Authenticate.ChallengeParam, req.Authenticate.ApplicationParam)
 
 		if err != nil {
-			log.Printf("pinentry err: %s", err)
+			log.Printf("user presence err: %s", err)
 			token.WriteResponse(parentCtx, evt, nil, statuscode.ConditionsNotSatisfied)
 
 			return
@@ -176,7 +200,7 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 				userPresent = 0x01
 			} else {
 				if result.Error != nil {
-					log.Printf("Got pinentry result err: %s", result.Error)
+					log.Printf("Got user presence result err: %s", result.Error)
 				}
 
 				// Got user cancelation, we want to propagate that so the browser gives up.
@@ -230,10 +254,10 @@ func (s *server) handleRegister(parentCtx context.Context, token *fidohid.SoftTo
 	defer cancel()
 	req := evt.Req
 
-	pinResultCh, err := s.pe.ConfirmPresence("FIDO Confirm Register", req.Register.ChallengeParam, req.Register.ApplicationParam)
+	pinResultCh, err := s.up.ConfirmPresence("FIDO Confirm Register", req.Register.ChallengeParam, req.Register.ApplicationParam)
 
 	if err != nil {
-		log.Printf("pinentry err: %s", err)
+		log.Printf("user presence err: %s", err)
 		token.WriteResponse(ctx, evt, nil, statuscode.ConditionsNotSatisfied)
 
 		return
@@ -243,7 +267,7 @@ func (s *server) handleRegister(parentCtx context.Context, token *fidohid.SoftTo
 	case result := <-pinResultCh:
 		if !result.OK {
 			if result.Error != nil {
-				log.Printf("Got pinentry result err: %s", result.Error)
+				log.Printf("Got user presence result err: %s", result.Error)
 			}
 
 			// Got user cancelation, we want to propagate that so the browser gives up.
